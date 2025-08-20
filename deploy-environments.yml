@@ -1,0 +1,59 @@
+name: Deploy to Environments
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      version:
+        description: 'Image tag to deploy'
+        required: false
+        type: string
+
+jobs:
+  deploy-to-environment:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Kubernetes
+      uses: azure/setup-kubectl@v3
+
+    - name: Configure Kubernetes
+      run: |
+        mkdir -p ~/.kube
+        echo '${{ secrets.KUBE_CONFIG }}' | base64 -d > ~/.kube/config
+
+        # Set appropriate server based on environment
+        if [ "${{ github.event.inputs.environment }}" = "production" ]; then
+          kubectl config set-cluster prod --server=${{ secrets.KUBE_SERVER_PROD }}
+        else
+          kubectl config set-cluster staging --server=${{ secrets.KUBE_SERVER_STAGING }}
+        fi
+
+    - name: Deploy application
+      run: |
+        IMAGE_TAG=${{ github.event.inputs.version || github.sha }}
+
+        # Apply Kubernetes manifests
+        kubectl apply -f k8s/${{ github.event.inputs.environment }}/
+
+        # Update image if version specified
+        if [ -n "${{ github.event.inputs.version }}" ]; then
+          kubectl set image deployment/${{ env.APP_NAME }} \
+            ${{ env.APP_NAME }}=${{ env.APP_IMAGE }}:${{ github.event.inputs.version }} \
+            -n ${{ github.event.inputs.environment }}
+        fi
+
+        kubectl rollout status deployment/${{ env.APP_NAME }} \
+          -n ${{ github.event.inputs.environment }} \
+          --timeout=300s

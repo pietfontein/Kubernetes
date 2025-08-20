@@ -1,0 +1,111 @@
+# .gitlab-ci.yml
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  # Docker configuration
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2
+
+  # Application variables
+  APP_NAME: "my-app"
+  APP_IMAGE: "registry.example.com/group/project"
+  KUBE_NAMESPACE: "production"
+
+# Use Docker-in-Docker for building
+services:
+  - docker:dind
+
+before_script:
+  - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+
+build:
+  stage: build
+  image: docker:latest
+  script:
+    - docker build -t $APP_IMAGE:$CI_COMMIT_SHA .
+    - docker push $APP_IMAGE:$CI_COMMIT_SHA
+    - docker tag $APP_IMAGE:$CI_COMMIT_SHA $APP_IMAGE:latest
+    - docker push $APP_IMAGE:latest
+  only:
+    - main
+    - develop
+
+test:
+  stage: test
+  image: node:16-alpine
+  script:
+    - npm install
+    - npm test
+    - npm run lint
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      junit: junit.xml
+    paths:
+      - coverage/
+
+deploy:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  script:
+    - |
+      # Update Kubernetes deployment
+      kubectl set image deployment/$APP_NAME $APP_NAME=$APP_IMAGE:$CI_COMMIT_SHA -n $KUBE_NAMESPACE
+      kubectl rollout status deployment/$APP_NAME -n $KUBE_NAMESPACE --timeout=300s
+  environment:
+    name: production
+    url: https://my-app.example.com
+  only:
+    - main
+# .gitlab-ci.yml (extended)
+.deploy-template: &deploy-template
+  stage: deploy
+  image: bitnami/kubectl:latest
+  script:
+    - kubectl config set-cluster local --server=$KUBE_SERVER --insecure-skip-tls-verify=true
+    - kubectl config set-credentials gitlab-ci --token=$KUBE_TOKEN
+    - kubectl config set-context default --cluster=local --user=gitlab-ci
+    - kubectl config use-context default
+    - kubectl apply -f k8s/${CI_ENVIRONMENT_NAME}/
+    - kubectl rollout status deployment/$APP_NAME -n ${CI_ENVIRONMENT_NAME}
+
+deploy-staging:
+  <<: *deploy-template
+  environment:
+    name: staging
+    url: https://staging.example.com
+  variables:
+    KUBE_SERVER: "https://k8s-staging.example.com"
+    KUBE_TOKEN: "$KUBE_TOKEN_STAGING"
+  only:
+    - develop
+
+deploy-production:
+  <<: *deploy-template
+  environment:
+    name: production
+    url: https://app.example.com
+  variables:
+    KUBE_SERVER: "https://k8s-prod.example.com"
+    KUBE_TOKEN: "$KUBE_TOKEN_PROD"
+  only:
+    - main
+  when: manual
+
+migrations:
+  stage: deploy
+  image: appropriate/curl:latest
+  script:
+    - |
+      # Wait for deployment to be ready
+      until curl -f http://my-app-service/db/status; do
+        echo "Waiting for application to be ready..."
+        sleep 5
+      done
+      # Run migrations
+      curl -X POST http://my-app-service/db/migrate
+  needs: ["deploy"]
